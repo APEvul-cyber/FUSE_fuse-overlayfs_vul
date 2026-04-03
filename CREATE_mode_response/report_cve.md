@@ -64,3 +64,7 @@ fd = direct_create_file(get_upper_layer(lo), ..., flags, safe_mode);
 ```
 
 Alternatively, the sanitization can be applied inside `direct_create_file()` or `safe_openat()` for defense in depth. A caller-UID-aware approach would check `fuse_req_ctx(req)->uid` and only strip the bits for non-root callers.
+
+---
+
+**Full PoC and scripts**: [GitHub Repository](https://github.com/APEvul-cyber/FUSE_fuse-overlayfs_vul/tree/main/CREATE_mode_response)

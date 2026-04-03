@@ -49,3 +49,7 @@ mode_t safe_mode = mode & ~ctx->umask;
 safe_mode &= ~(S_ISUID | S_ISGID);
 fd = direct_create_file(get_upper_layer(lo), ..., flags, safe_mode);
 ```
+
+---
+
+**Full PoC and scripts**: [GitHub Repository](https://github.com/APEvul-cyber/FUSE_fuse-overlayfs_vul/tree/main/CREATE_mode_response)
