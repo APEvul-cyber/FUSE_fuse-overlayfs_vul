@@ -1,0 +1,135 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Linux system with FUSE protocol ≥ 7.3 (CREATE supported) and a privileged FUSE filesystem daemon running as root.
+  - The filesystem is mounted by root without `nosuid`/`nodev` (i.e., setuid/setgid bits on FUSE files are honored by the kernel).
+  - The daemon uses `fuse_create_in.mode` as the authoritative initial mode for backing files and reports that mode back via `fuse_entry_out.attr.mode`.
+  - The daemon stores backing files on a native filesystem (e.g., ext4) as `root:root`, but exposes them to clients through FUSE with `attr.uid = 0` and `attr.gid = 0` (or otherwise more-privileged than the caller).
+  - The daemon does not sanitize S_ISUID/S_ISGID bits from `fuse_create_in.mode` when creating or chmod-ing the backing file, even when the caller is unprivileged.
+
+- **Attacker Capability:**
+  - Unprivileged local user with ordinary access to the FUSE mount (can run `open(2)/creat(2)` under their own UID, but has no special capabilities and does not control the FUSE daemon or kernel).
+  - Can specify arbitrary mode bits in `open(..., O_CREAT, mode)` (including S_ISUID/S_ISGID), and can later execute files on the mount.
+  - Cannot directly create setuid-root files on the underlying native filesystem and cannot change ownership there.
+
+---
+
+**Attack Procedure:**
+
+1. **Setup by administrator (trusted side):**
+   - Root starts a FUSE daemon `rootmirrorfs` that:
+     - Runs as UID 0.
+     - Backs `/mnt/rootmirror` by `/srv/rootmirror` on ext4.
+     - For each `FUSE_CREATE`:
+       - Creates `/srv/rootmirror/<path>` as `root:root`.
+       - Calls `fchmod(fd, in.mode)` where `in.mode` is `fuse_create_in.mode`.
+       - Returns `attr.uid = 0`, `attr.gid = 0`, `attr.mode = (S_IFREG | in.mode)` in `fuse_entry_out`.
+   - Mount is performed by root with options that *do not* include `nosuid`. The kernel will honor setuid bits on this FUSE mount.
+
+2. **Attacker creates a setuid helper:**
+   - Attacker compiles a binary `exploit` that, when run, spawns a root shell (e.g., C program calling `setuid(0); system("/bin/sh");`).
+   - Attacker wants this binary to be setuid-root, which they cannot do directly on ext4.
+
+3. **Attacker triggers FUSE_CREATE with S_ISUID:**
+   - Attacker runs:
+     ```c
+     int fd = open("/mnt/rootmirror/exploit",
+                   O_CREAT | O_WRONLY | O_EXCL,
+                   04711);  // S_ISUID | rwx for owner, x for group/others
+     ```
+   - The kernel:
+     - Validates permissions for creating a file on the FUSE mount (caller is unprivileged but allowed to create).
+     - Derives `fuse_create_in.mode` from the syscall mode and umask:
+       - S_ISUID is preserved for regular files created by an unprivileged user (setuid to themselves is normally allowed).
+       - Umask is applied unless `FUSE_DONT_MASK` was negotiated; either way, S_ISUID survives.
+     - Sends a `FUSE_CREATE` request to the daemon with `fuse_create_in.mode = 04711`.
+
+4. **Daemon improperly trusts `mode` as privileged policy:**
+   - `rootmirrorfs` receives:
+     - `fuse_create_in.mode = 04711` (requested by unprivileged user).
+     - `fuse_create_in.umask = 0022` (if `FUSE_DONT_MASK` is set) or ignored otherwise.
+   - Daemon:
+     - Creates `/srv/rootmirror/exploit` on ext4 as root.
+     - Calls `fchmod(fd, 04711)`. Because it runs as root, ext4 accepts this as **setuid-root** (owner=0, mode=04711).
+     - Fills reply:
+       - `attr.uid = 0`
+       - `attr.gid = 0`
+       - `attr.mode = (S_IFREG | 04711)`
+
+5. **Kernel exposes a suid-root FUSE file:**
+   - Kernel receives `fuse_entry_out` and caches:
+     - File is owned by root (`attr.uid = 0`).
+     - Has S_ISUID set (`attr.mode & S_ISUID`).
+   - Mount lacks `nosuid`, so this file is treated like any other suid-root binary on a native filesystem.
+
+6. **Attacker escalates privileges:**
+   - Attacker closes `fd` after writing the `exploit` binary.
+   - Attacker executes:
+     ```sh
+     /mnt/rootmirror/exploit
+     ```
+   - Kernel executes a FUSE file that appears as:
+     - UID: 0
+     - Mode: setuid-root, executable
+   - Standard Linux semantics apply: process effective UID becomes 0. Attacker obtains a root shell.
+
+**Security contract violated:**
+- Native VFS semantics assume that when an unprivileged user sets S_ISUID on file creation, the resulting file’s owner is the creator’s UID, so they do not gain *new* privilege by executing it.
+- In this FUSE design, `fuse_create_in.mode` is blindly applied to a file owned by root, and the daemon reports it as root-owned to the kernel, transforming a “setuid-self” request into a setuid-root binary.
+- Thus, `fuse_create_in.mode` carries untrusted setuid bits across a trust boundary (unprivileged client → privileged daemon) and is misused to create a privilege-escalating condition.
+
+---
+
+**Attack Message:**
+```json
+{
+  "mount": {
+    "options": "defaults", 
+    "nosuid": false,
+    "fs": "fuse.rootmirrorfs",
+    "daemon_uid": 0
+  },
+
+  "request": {
+    "direction": "kernel_to_daemon",
+    "opcode": "FUSE_CREATE (35)",
+    "struct fuse_create_in": {
+      "flags": "O_CREAT|O_WRONLY|O_EXCL",
+      "mode": "04711",          // S_ISUID + execute bits; chosen by attacker
+      "umask": "0022",
+      "open_flags": "0"
+    },
+    "path": "exploit"
+  },
+
+  "daemon_behavior": {
+    "backing_create": {
+      "fs": "ext4:/srv/rootmirror/exploit",
+      "owner": "root:root",
+      "chmod": "04711"          // uses fuse_create_in.mode verbatim
+    }
+  },
+
+  "response": {
+    "direction": "daemon_to_kernel",
+    "opcode": "FUSE_CREATE reply",
+    "payload": {
+      "fuse_entry_out": {
+        "attr": {
+          "ino": 12345,
+          "mode": "01004711",   // regular file + S_ISUID
+          "uid": 0,             // root owner exposed to kernel
+          "gid": 0
+        }
+      },
+      "fuse_open_out": {
+        "fh": 0xdeadbeef,
+        "open_flags": 0
+      }
+    }
+  },
+
+  "security_relevance": "Unprivileged user-controlled mode (including S_ISUID) is used by a root daemon to create and expose a setuid-root file, leading to local privilege escalation when executed."
+}
+```
+
+**Classification:** ATTACK

